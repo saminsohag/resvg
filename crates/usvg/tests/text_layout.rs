@@ -1,12 +1,10 @@
 // Copyright 2024 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Regression tests for complex-script (Indic) glyph layout.
+//! Regression test for complex-script (Indic) glyph advance.
 //!
-//! A cluster that contains several *spacing* glyphs — e.g. a Devanagari/Bengali
-//! consonant plus a pre-base vowel sign — must advance by the SUM of its glyph
-//! advances, not the max. Using the max makes the cluster too narrow so the
-//! next cluster is drawn on top of it (overlapping text).
+//! Ordering/itemization of mixed Latin+Indic runs is covered by the
+//! `text_text_glyph_splitting` reference-image test in the `resvg` crate.
 
 #[cfg(feature = "text")]
 fn tree_with_devanagari(text: &str) -> usvg::Tree {
@@ -47,15 +45,16 @@ fn glyph_origins(tree: &usvg::Tree) -> Vec<f32> {
     out
 }
 
-// `कि` = क (consonant) + ि (pre-base vowel sign, U+093F). The vowel sign is
-// reordered before the consonant and both are spacing glyphs sharing one
-// cluster. `किमिति` chains several such clusters so any per-cluster
-// under-advance accumulates into a clearly measurable, overlapping run.
+// A Devanagari consonant plus a pre-base vowel sign (U+093F) forms a cluster of
+// two spacing glyphs: the vowel is reordered before the consonant. That cluster
+// must advance by the SUM of the two glyph advances, not the max — using the max
+// makes each cluster too narrow so the following cluster is laid out on top of
+// it (overlapping text). `किमिति` chains four such clusters, so the shortfall
+// accumulates into a clearly measurable total width.
 #[cfg(feature = "text")]
 #[test]
 fn indic_pre_base_vowel_does_not_overlap() {
-    let tree = tree_with_devanagari("किमिति");
-    let origins = glyph_origins(&tree);
+    let origins = glyph_origins(&tree_with_devanagari("किमिति"));
 
     assert!(
         origins.len() >= 6,
@@ -63,25 +62,22 @@ fn indic_pre_base_vowel_does_not_overlap() {
         origins.len()
     );
 
-    // No glyph may start to the left of a glyph that precedes it in the run:
-    // that is exactly the overlap the max-advance bug produced.
+    // Glyph origins must never move backwards: a cluster starting left of where
+    // the previous cluster ends is the visible overlap.
     for w in origins.windows(2) {
         assert!(
             w[1] + 0.01 >= w[0],
-            "glyph origins must not move backwards (overlap): {origins:?}"
+            "glyph origins moved backwards (overlap): {origins:?}"
         );
     }
 
-    // The whole word must span a sensible width. With the max-advance bug the
-    // clusters collapse onto each other and the rightmost origin stays well
-    // under this bound; with the correct summed advance it clears it easily.
-    // Measured: the max-advance bug collapses this word to ~64.8px, the correct
-    // summed advance spreads it to ~85.5px. 75px sits between, so the test
-    // fails on the bug and passes on the fix with margin either side.
+    // Measured: the max-advance bug collapses this word to ~64.8px wide, the
+    // correct summed advance spreads it to ~85.5px. 75px sits between, so the
+    // test fails on the bug and passes on the fix with margin either side.
     let rightmost = origins.iter().cloned().fold(0.0_f32, f32::max);
     assert!(
         rightmost > 75.0,
         "text collapsed — rightmost glyph origin was only {rightmost:.1}px \
-         (indicates clusters advancing by max instead of sum)"
+         (clusters advancing by max instead of sum)"
     );
 }

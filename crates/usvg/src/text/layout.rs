@@ -1459,6 +1459,42 @@ pub(crate) fn shape_text(
     glyphs
 }
 
+/// Splits `text` into maximal runs of a single script, in logical order.
+///
+/// `Common`, `Inherited` and `Unknown` characters (spaces, punctuation,
+/// combining marks) don't start a new segment — they extend the current script
+/// run, matching Unicode's script-itemization convention. Leading neutral
+/// characters attach to the first real script that follows.
+fn itemize_by_script(text: &str) -> Vec<std::ops::Range<usize>> {
+    use unicode_script::Script;
+
+    let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut seg_start = 0;
+    let mut cur_script: Option<Script> = None;
+
+    for (i, ch) in text.char_indices() {
+        let script = ch.script();
+        if matches!(
+            script,
+            Script::Common | Script::Inherited | Script::Unknown
+        ) {
+            continue;
+        }
+        match cur_script {
+            None => cur_script = Some(script),
+            Some(cs) if cs == script => {}
+            Some(_) => {
+                segments.push(seg_start..i);
+                seg_start = i;
+                cur_script = Some(script);
+            }
+        }
+    }
+
+    segments.push(seg_start..text.len());
+    segments
+}
+
 /// Converts a text into a list of glyph IDs.
 ///
 /// This function will do the BIDI reordering and text shaping.
@@ -1517,10 +1553,18 @@ fn shape_text_with_font(
 
         let mut glyphs = Vec::new();
 
+        let mut features = Vec::new();
+        if small_caps {
+            features.push(rustybuzz::Feature::new(Tag::from_bytes(b"smcp"), 1, ..));
+        }
+        if !apply_kerning {
+            features.push(rustybuzz::Feature::new(Tag::from_bytes(b"kern"), 0, ..));
+        }
+
         let (levels, runs) = bidi_info.visual_runs(paragraph, line);
         for run in runs.iter() {
-            let sub_text = &text[run.clone()];
-            if sub_text.is_empty() {
+            let run_text = &text[run.clone()];
+            if run_text.is_empty() {
                 continue;
             }
 
@@ -1531,49 +1575,66 @@ fn shape_text_with_font(
                 rustybuzz::Direction::RightToLeft
             };
 
-            let mut buffer = rustybuzz::UnicodeBuffer::new();
-            buffer.push_str(sub_text);
-            buffer.set_direction(hb_direction);
-
-            let mut features = Vec::new();
-            if small_caps {
-                features.push(rustybuzz::Feature::new(Tag::from_bytes(b"smcp"), 1, ..));
+            // Itemize the run into maximal single-script segments before shaping.
+            //
+            // rustybuzz shapes a buffer under a single script, so a run mixing
+            // scripts (e.g. Latin `v (` + Bengali `উপরে`) would be shaped with one
+            // guessed script — taken from the first strong character. When that
+            // guess isn't the complex script, its shaper never runs and Indic
+            // reordering (pre-base vowels ি/ে/ৈ, conjuncts) is skipped, so the
+            // vowel ends up after its consonant. Splitting per script lets each
+            // segment be shaped with the correct shaper. Segments are visited in
+            // visual order (reversed for RTL runs) so the produced glyphs stay in
+            // left-to-right visual order like the rest of the pipeline expects.
+            let mut segments = itemize_by_script(run_text);
+            if !ltr {
+                segments.reverse();
             }
 
-            if !apply_kerning {
-                features.push(rustybuzz::Feature::new(Tag::from_bytes(b"kern"), 0, ..));
-            }
-
-            let output = rustybuzz::shape(&rb_font, &features, buffer);
-
-            let positions = output.glyph_positions();
-            let infos = output.glyph_infos();
-
-            for i in 0..output.len() {
-                let pos = positions[i];
-                let info = infos[i];
-                let idx = run.start + info.cluster as usize;
-
-                let start = info.cluster as usize;
-
-                let end = if ltr {
-                    i.checked_add(1)
-                } else {
-                    i.checked_sub(1)
+            for seg in segments {
+                let sub_text = &run_text[seg.clone()];
+                if sub_text.is_empty() {
+                    continue;
                 }
-                .and_then(|last| infos.get(last))
-                .map_or(sub_text.len(), |info| info.cluster as usize);
+                // Byte offset of this segment within the whole `text`.
+                let seg_offset = run.start + seg.start;
 
-                glyphs.push(Glyph {
-                    byte_idx: ByteIndex::new(idx),
-                    cluster_len: end.checked_sub(start).unwrap_or(0), // TODO: can fail?
-                    text: sub_text[start..end].to_string(),
-                    id: GlyphId(info.glyph_id as u16),
-                    dx: pos.x_offset,
-                    dy: pos.y_offset,
-                    width: pos.x_advance,
-                    font: font.clone(),
-                });
+                let mut buffer = rustybuzz::UnicodeBuffer::new();
+                buffer.push_str(sub_text);
+                buffer.set_direction(hb_direction);
+                // A single-script segment lets rustybuzz guess the right script.
+
+                let output = rustybuzz::shape(&rb_font, &features, buffer);
+
+                let positions = output.glyph_positions();
+                let infos = output.glyph_infos();
+
+                for i in 0..output.len() {
+                    let pos = positions[i];
+                    let info = infos[i];
+                    let idx = seg_offset + info.cluster as usize;
+
+                    let start = info.cluster as usize;
+
+                    let end = if ltr {
+                        i.checked_add(1)
+                    } else {
+                        i.checked_sub(1)
+                    }
+                    .and_then(|last| infos.get(last))
+                    .map_or(sub_text.len(), |info| info.cluster as usize);
+
+                    glyphs.push(Glyph {
+                        byte_idx: ByteIndex::new(idx),
+                        cluster_len: end.checked_sub(start).unwrap_or(0), // TODO: can fail?
+                        text: sub_text[start..end].to_string(),
+                        id: GlyphId(info.glyph_id as u16),
+                        dx: pos.x_offset,
+                        dy: pos.y_offset,
+                        width: pos.x_advance,
+                        font: font.clone(),
+                    });
+                }
             }
         }
 
