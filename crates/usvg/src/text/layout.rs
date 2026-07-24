@@ -1354,23 +1354,74 @@ pub(crate) fn shape_text(
                 break 'outer;
             }
 
-            // We assume, that shaping with an any font will produce the same amount of glyphs.
-            // This is incorrect, but good enough for now.
-            if glyphs.len() != fallback_glyphs.len() {
-                break 'outer;
-            }
+            // Merge the fallback glyphs into the primary run on a per-cluster
+            // (byte-range) basis.
+            //
+            // We cannot assume that the primary and fallback fonts produce the
+            // same number of glyphs for the same text: complex scripts (Bengali,
+            // Devanagari, Arabic, …) reorder marks and form conjuncts/ligatures,
+            // so a fallback font routinely yields a different glyph count than the
+            // string of `.notdef` boxes the primary font produced. The previous
+            // implementation bailed out (`break 'outer`) whenever the counts
+            // differed and merged strictly by glyph index otherwise — which
+            // dropped the fallback text entirely for any run that mixed a
+            // complex script with characters the primary font *could* render
+            // (e.g. `বাংলা (x)`). Instead, locate each contiguous run of missing
+            // glyphs and splice in the fallback glyphs covering the same source
+            // byte range, but only when the fallback actually resolved that range.
+            let mut resolved_any = false;
+            let mut i = 0;
+            while i < glyphs.len() {
+                if !glyphs[i].is_missing() {
+                    i += 1;
+                    continue;
+                }
 
-            // TODO: Replace clusters and not glyphs. This should be more accurate.
+                // Extent of this contiguous missing run, in glyph indices and in
+                // source-text bytes. Glyphs are in visual order; for the LTR base
+                // direction used here that matches byte order, so a contiguous
+                // missing glyph run maps to a contiguous byte range.
+                let run_start = i;
+                let mut run_end = i;
+                let byte_start = glyphs[i].byte_idx.value();
+                let mut byte_end = byte_start + glyphs[i].cluster_len;
+                while run_end + 1 < glyphs.len() && glyphs[run_end + 1].is_missing() {
+                    run_end += 1;
+                    let g = &glyphs[run_end];
+                    byte_end = byte_end.max(g.byte_idx.value() + g.cluster_len);
+                }
 
-            // Copy new glyphs.
-            for i in 0..glyphs.len() {
-                if glyphs[i].is_missing() && !fallback_glyphs[i].is_missing() {
-                    glyphs[i] = fallback_glyphs[i].clone();
+                // The fallback glyphs covering the same source byte range.
+                let replacement: Vec<Glyph> = fallback_glyphs
+                    .iter()
+                    .filter(|g| {
+                        let b = g.byte_idx.value();
+                        b >= byte_start && b < byte_end
+                    })
+                    .cloned()
+                    .collect();
+
+                // Splice only when the fallback resolved the whole range; leave
+                // still-missing glyphs in place so the next fallback font (if any)
+                // gets a chance at them.
+                if !replacement.is_empty() && replacement.iter().all(|g| !g.is_missing()) {
+                    let count = replacement.len();
+                    glyphs.splice(run_start..=run_end, replacement);
+                    resolved_any = true;
+                    i = run_start + count;
+                } else {
+                    i = run_end + 1;
                 }
             }
 
             // Remember this font.
             used_fonts.push(fallback_font.id);
+
+            // No progress this pass means no reachable font can resolve the
+            // remaining glyphs — stop to avoid looping forever.
+            if !resolved_any {
+                break 'outer;
+            }
         } else {
             break 'outer;
         }
