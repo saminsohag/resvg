@@ -1144,7 +1144,16 @@ fn apply_word_spacing(chunk: &TextChunk, clusters: &mut [GlyphCluster]) {
 fn form_glyph_clusters(glyphs: &[Glyph], text: &str, font_size: f32) -> GlyphCluster {
     debug_assert!(!glyphs.is_empty());
 
+    // `width` is the widest single glyph (used for bbox/decoration and, in
+    // vertical writing mode, to size the rotated cluster). `advance` is how far
+    // the pen moves to the next cluster and must be the *sum* of the glyphs'
+    // advances, not the max: a single-glyph cluster or a base glyph plus
+    // zero-advance combining marks both reduce to one advance, but complex
+    // scripts (Bengali, Devanagari, …) place several *spacing* glyphs in one
+    // cluster — pre-base vowels (ি, ে, ৈ) and conjunct forms — where `max`
+    // makes the cluster too narrow and the next cluster overlaps it.
     let mut width = 0.0;
+    let mut advance: f32 = 0.0;
     let mut x: f32 = 0.0;
 
     let mut positioned_glyphs = vec![];
@@ -1174,6 +1183,7 @@ fn form_glyph_clusters(glyphs: &[Glyph], text: &str, font_size: f32) -> GlyphClu
         });
 
         x += glyph.width as f32;
+        advance += glyph.width as f32 * sx;
 
         let glyph_width = glyph.width as f32 * sx;
         if glyph_width > width {
@@ -1187,7 +1197,7 @@ fn form_glyph_clusters(glyphs: &[Glyph], text: &str, font_size: f32) -> GlyphClu
         byte_idx,
         codepoint: byte_idx.char_from(text),
         width,
-        advance: width,
+        advance,
         ascent: font.ascent(font_size),
         descent: font.descent(font_size),
         has_relative_shift: false,
@@ -1378,25 +1388,31 @@ pub(crate) fn shape_text(
                 }
 
                 // Extent of this contiguous missing run, in glyph indices and in
-                // source-text bytes. Glyphs are in visual order; for the LTR base
-                // direction used here that matches byte order, so a contiguous
-                // missing glyph run maps to a contiguous byte range.
+                // source-text bytes. Glyphs are in visual order, which is *not*
+                // necessarily byte order: within a right-to-left run (Arabic,
+                // Hebrew) the byte indices descend. So we take the min/max of the
+                // byte range over the whole run rather than assuming it grows
+                // forward, otherwise an RTL run's range would be computed wrong
+                // and its glyphs never get replaced (dropping the text).
                 let run_start = i;
                 let mut run_end = i;
-                let byte_start = glyphs[i].byte_idx.value();
-                let mut byte_end = byte_start + glyphs[i].cluster_len;
+                let mut byte_lo = glyphs[i].byte_idx.value();
+                let mut byte_hi = byte_lo + glyphs[i].cluster_len;
                 while run_end + 1 < glyphs.len() && glyphs[run_end + 1].is_missing() {
                     run_end += 1;
                     let g = &glyphs[run_end];
-                    byte_end = byte_end.max(g.byte_idx.value() + g.cluster_len);
+                    byte_lo = byte_lo.min(g.byte_idx.value());
+                    byte_hi = byte_hi.max(g.byte_idx.value() + g.cluster_len);
                 }
 
-                // The fallback glyphs covering the same source byte range.
+                // The fallback glyphs covering the same source byte range, kept in
+                // their own visual order (which, being shaped with the same base
+                // direction, matches the order of the run we are replacing).
                 let replacement: Vec<Glyph> = fallback_glyphs
                     .iter()
                     .filter(|g| {
                         let b = g.byte_idx.value();
-                        b >= byte_start && b < byte_end
+                        b >= byte_lo && b < byte_hi
                     })
                     .cloned()
                     .collect();
